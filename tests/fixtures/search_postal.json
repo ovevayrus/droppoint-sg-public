@@ -1,0 +1,19 @@
+{
+  "found": 1,
+  "totalNumPages": 1,
+  "pageNum": 1,
+  "results": [
+    {
+      "SEARCHVAL": "NOVENA MRT STATION (NS20)",
+      "BLK_NO": "",
+      "ROAD_NAME": "THOMSON ROAD",
+      "BUILDING": "NOVENA MRT STATION (NS20)",
+      "ADDRESS": "THOMSON ROAD NOVENA MRT STATION (NS20) SINGAPORE 307470",
+      "POSTAL": "307470",
+      "X": "28983.8493",
+      "Y": "33554.2098",
+      "LATITUDE": "1.320359",
+      "LONGITUDE": "103.843818"
+    }
+  ]
+}

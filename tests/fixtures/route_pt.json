@@ -1,0 +1,27 @@
+{
+  "requestParameters": {
+    "date": "06-28-2026",
+    "time": "09:00:00",
+    "mode": "TRANSIT",
+    "maxWalkDistance": "1000",
+    "numItineraries": "3"
+  },
+  "plan": {
+    "itineraries": [
+      {
+        "duration": 5400,
+        "walkTime": 600,
+        "transitTime": 4500,
+        "waitingTime": 300,
+        "transfers": 1
+      },
+      {
+        "duration": 6000,
+        "walkTime": 800,
+        "transitTime": 4800,
+        "waitingTime": 400,
+        "transfers": 2
+      }
+    ]
+  }
+}
