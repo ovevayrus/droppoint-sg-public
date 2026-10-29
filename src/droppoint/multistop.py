@@ -56,7 +56,6 @@ with real OneMap times before anything is shown (``exact`` marks fully verified 
 
 from __future__ import annotations
 
-import asyncio
 import itertools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -66,6 +65,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from .config import OptimiserConfig
+from .limits import gather_cancel
 from .onemap import LatLng, RouteClient
 from .stations import Station, corridor_prefilter, haversine_km
 
@@ -630,7 +630,7 @@ async def _optimise_joint(
             start, end = r, (station or final_dest)  # from the rider's home
         return client.pt(start, end, depart)
 
-    baselines = await asyncio.gather(
+    baselines = await gather_cancel(
         client.drive(origin, final_dest, depart),
         *(rider_pt(r) for r in rider_points),
     )
@@ -645,12 +645,12 @@ async def _optimise_joint(
     ]
 
     # Exact legs: A->P and P->end for every unique stop point, and each rider's PT leg
-    # to/from their candidate stations. The client caches and deduplicates, so
-    # overlapping candidates cost nothing extra.
+    # to/from their candidate stations. Completed legs can be reused from this
+    # trip's cache; every actual outbound attempt still counts toward its budget.
     points = list({st.point for group in candidates for st in group} | set(rider_points))
-    a_times, b_times = await asyncio.gather(
-        asyncio.gather(*(client.drive(origin, p, depart) for p in points)),
-        asyncio.gather(*(client.drive(p, final_dest, depart) for p in points)),
+    a_times, b_times = await gather_cancel(
+        gather_cancel(*(client.drive(origin, p, depart) for p in points)),
+        gather_cancel(*(client.drive(p, final_dest, depart) for p in points)),
     )
     exact_legs: dict[tuple[LatLng, LatLng], float] = {(origin, final_dest): base_d}
     for p, t in zip(points, a_times, strict=True):
@@ -665,7 +665,7 @@ async def _optimise_joint(
         for i, group in enumerate(candidates)
         for st in group
     ]
-    pt_times = await asyncio.gather(*(task for _, _, task in pt_tasks))
+    pt_times = await gather_cancel(*(task for _, _, task in pt_tasks))
     pt_by_rider: list[dict[str, float]] = [{} for _ in rider_points]
     for (i, st, _), t in zip(pt_tasks, pt_times, strict=True):
         if t is not None:
@@ -744,7 +744,7 @@ async def _optimise_joint(
             break
         attempted |= needed
         pairs = list(needed)
-        times = await asyncio.gather(*(client.drive(a, b, depart) for a, b in pairs))
+        times = await gather_cancel(*(client.drive(a, b, depart) for a, b in pairs))
         for (a, b), t in zip(pairs, times, strict=True):
             if t is not None:
                 exact_legs[(a, b)] = t

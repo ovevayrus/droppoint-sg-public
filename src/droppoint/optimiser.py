@@ -18,12 +18,12 @@ station dataset). Everything here is deterministic and unit-tested offline.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime
 
 from pydantic import BaseModel
 
 from .config import OptimiserConfig
+from .limits import gather_cancel
 from .onemap import LatLng, RouteClient
 from .stations import Station, corridor_prefilter
 
@@ -193,7 +193,7 @@ async def _score_all(
     config: OptimiserConfig,
 ) -> list[ScoredCandidate]:
     async def score_one(st: Station) -> ScoredCandidate | None:
-        drive_ap, drive_pb, pt_pc = await asyncio.gather(
+        drive_ap, drive_pb, pt_pc = await gather_cancel(
             client.drive(origin, st.point, depart),
             client.drive(st.point, driver_dest, depart),
             client.pt(st.point, rider_dest, depart),
@@ -214,7 +214,7 @@ async def _score_all(
             config=config,
         )
 
-    results = await asyncio.gather(*(score_one(st) for st in candidates))
+    results = await gather_cancel(*(score_one(st) for st in candidates))
     return [r for r in results if r is not None]
 
 

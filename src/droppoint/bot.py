@@ -9,7 +9,6 @@ Postal codes may also be addresses; each is geocoded through OneMap.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -27,6 +26,7 @@ from telegram.ext import (
 
 from .config import get_settings
 from .formatting import format_multi_result, format_plan_options
+from .limits import Admission, TripWork, WorkLimitExceeded, gather_cancel, trip_scope
 from .multistop import optimise_multi, optimise_pickup
 from .onemap import LatLng, OneMapClient
 from .optimiser import optimise
@@ -166,7 +166,7 @@ async def _geocode_all(client, tokens: list[str]) -> list[tuple[LatLng, str] | N
             return None
         return geo.point, geo.label
 
-    return list(await asyncio.gather(*(_one(t) for t in tokens)))
+    return await gather_cancel(*(_one(t) for t in tokens))
 
 
 def _parse_depart(text: str) -> datetime | None:
@@ -192,6 +192,14 @@ def _clear_trip_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     clear_cache = getattr(bot_data.get("client"), "clear_cache", None)
     if callable(clear_cache):
         clear_cache()
+
+
+def _new_work(context: ContextTypes.DEFAULT_TYPE) -> TripWork:
+    limits = context.bot_data.get("work_limits", {})
+    return TripWork(
+        max_attempts=limits.get("requests", 300),
+        remaining_seconds=limits.get("seconds", 180.0),
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -261,7 +269,17 @@ async def received_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         chat = update.effective_chat
         if chat is not None:
             await chat.send_action(ChatAction.TYPING)
-        resolved = await _geocode_all(context.bot_data["client"], tokens)
+        admission = context.bot_data.get("admission")
+        user_id = getattr(getattr(update, "effective_user", None), "id", None)
+        if admission is not None and user_id is not None:
+            admission.claim(user_id)
+        work = _new_work(context)
+        async with trip_scope(work):
+            resolved = await _geocode_all(context.bot_data["client"], tokens)
+    except (WorkLimitExceeded, TimeoutError):
+        _clear_trip_data(context)
+        await update.message.reply_text("This trip reached a work limit. Please try again later.")
+        return ConversationHandler.END
     except Exception as exc:  # noqa: BLE001
         logger.error("Location lookup failed (%s)", type(exc).__name__)
         _clear_trip_data(context)
@@ -310,6 +328,7 @@ async def received_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["origin"] = resolved[0]
     context.user_data["driver_dest"] = resolved[1]
     context.user_data["riders"] = resolved[2:]
+    context.user_data["_trip_work"] = work
     return ASK_DEPART
 
 
@@ -325,65 +344,70 @@ async def received_depart(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     origin, _ = context.user_data["origin"]
     driver_dest, _ = context.user_data["driver_dest"]
     riders: list[tuple[LatLng, str]] = context.user_data["riders"]
+    work = context.user_data.get("_trip_work") or _new_work(context)
     _clear_trip_data(context)
 
     try:
-        chat = update.effective_chat
-        if chat is not None:
-            await chat.send_action(ChatAction.TYPING)
-        if mode == "pickup":
-            # Pick-ups: the driver heads to a shared destination and collects
-            # passengers en route; the joint planner handles any rider count.
-            result = await optimise_pickup(
-                context.bot_data["client"],
-                origin=origin,
-                shared_dest=driver_dest,
-                rider_origins=[point for point, _ in riders],
-                stations=context.bot_data["stations"],
-                depart=depart,
-                config=context.bot_data["config"],
-                rider_labels=[label for _, label in riders],
-            )
-            text = format_plan_options(
-                result,
-                origin=origin,
-                driver_dest=driver_dest,
-                rider_labels=[label for _, label in riders],
-                depart=depart,
-            )
-        elif len(riders) == 1:
-            rider_dest, _ = riders[0]
-            result = await optimise(
-                context.bot_data["client"],
-                origin=origin,
-                driver_dest=driver_dest,
-                rider_dest=rider_dest,
-                stations=context.bot_data["stations"],
-                depart=depart,
-                config=context.bot_data["config"],
-            )
-            text = format_multi_result(
-                [(result, riders[0])], origin=origin, driver_dest=driver_dest
-            )
-        else:
-            # Two or more passengers: plan one shared route with ordered drop-offs.
-            result = await optimise_multi(
-                context.bot_data["client"],
-                origin=origin,
-                driver_dest=driver_dest,
-                rider_dests=[point for point, _ in riders],
-                stations=context.bot_data["stations"],
-                depart=depart,
-                config=context.bot_data["config"],
-                rider_labels=[label for _, label in riders],
-            )
-            text = format_plan_options(
-                result,
-                origin=origin,
-                driver_dest=driver_dest,
-                rider_labels=[label for _, label in riders],
-                depart=depart,
-            )
+        async with trip_scope(work):
+            chat = update.effective_chat
+            if chat is not None:
+                await chat.send_action(ChatAction.TYPING)
+            if mode == "pickup":
+                # Pick-ups: the driver heads to a shared destination and collects
+                # passengers en route; the joint planner handles any rider count.
+                result = await optimise_pickup(
+                    context.bot_data["client"],
+                    origin=origin,
+                    shared_dest=driver_dest,
+                    rider_origins=[point for point, _ in riders],
+                    stations=context.bot_data["stations"],
+                    depart=depart,
+                    config=context.bot_data["config"],
+                    rider_labels=[label for _, label in riders],
+                )
+                text = format_plan_options(
+                    result,
+                    origin=origin,
+                    driver_dest=driver_dest,
+                    rider_labels=[label for _, label in riders],
+                    depart=depart,
+                )
+            elif len(riders) == 1:
+                rider_dest, _ = riders[0]
+                result = await optimise(
+                    context.bot_data["client"],
+                    origin=origin,
+                    driver_dest=driver_dest,
+                    rider_dest=rider_dest,
+                    stations=context.bot_data["stations"],
+                    depart=depart,
+                    config=context.bot_data["config"],
+                )
+                text = format_multi_result(
+                    [(result, riders[0])], origin=origin, driver_dest=driver_dest
+                )
+            else:
+                # Two or more passengers: plan one shared route with ordered drop-offs.
+                result = await optimise_multi(
+                    context.bot_data["client"],
+                    origin=origin,
+                    driver_dest=driver_dest,
+                    rider_dests=[point for point, _ in riders],
+                    stations=context.bot_data["stations"],
+                    depart=depart,
+                    config=context.bot_data["config"],
+                    rider_labels=[label for _, label in riders],
+                )
+                text = format_plan_options(
+                    result,
+                    origin=origin,
+                    driver_dest=driver_dest,
+                    rider_labels=[label for _, label in riders],
+                    depart=depart,
+                )
+    except (WorkLimitExceeded, TimeoutError):
+        await update.message.reply_text("This trip reached a work limit. Please try again later.")
+        return ConversationHandler.END
     except Exception as exc:  # noqa: BLE001
         # HTTP client exceptions can include the full request URL. Log only the
         # exception class so credentials and submitted locations stay private.
@@ -405,10 +429,24 @@ def build_application(settings, client) -> Application:
     token = settings.telegram_bot_token_value
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN is required")
-    app = Application.builder().token(token).build()
+
+    async def guard_delivery_mode(application):
+        webhook = await application.bot.get_webhook_info()
+        if webhook.url and not settings.allow_webhook_reset:
+            raise RuntimeError(
+                "This bot already has a webhook. Use a separate test bot, or explicitly "
+                "set ALLOW_WEBHOOK_RESET=true to switch this bot to polling."
+            )
+
+    app = Application.builder().token(token).post_init(guard_delivery_mode).build()
     app.bot_data["client"] = client
     app.bot_data["stations"] = list(default_stations())
     app.bot_data["config"] = settings.optimiser()
+    app.bot_data["admission"] = Admission(settings.trips_per_minute, settings.user_cooldown_seconds)
+    app.bot_data["work_limits"] = {
+        "requests": settings.max_trip_requests,
+        "seconds": settings.trip_work_seconds,
+    }
 
     private_chat = filters.ChatType.PRIVATE
     text_only = private_chat & filters.TEXT & ~filters.COMMAND

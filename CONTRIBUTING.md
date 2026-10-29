@@ -1,5 +1,7 @@
 # Contributing to DropPoint SG
 
+Use `pip install -c constraints.txt -e ".[dev]"` for the tested dependency resolution. New request/planner code must preserve cancellation cleanup, attempt/deadline accounting and safe logging; add delayed/failing mock-transport cases instead of live provider traffic. Test bots and accounts must be separate from production.
+
 Thanks for your interest. This is a small, focused project. Contributions that keep
 it simple are very welcome.
 
