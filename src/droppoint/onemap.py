@@ -14,9 +14,12 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import NamedTuple, Protocol
 
 import httpx
+
+from .limits import CURRENT_TRIP, WindowLimit, WorkLimitExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,7 @@ class OneMapClient:
         pt_max_walk_distance_m: int = 1000,
         pt_num_itineraries: int = 3,
         timeout: float = 30.0,
+        requests_per_minute: int = 600,
     ) -> None:
         self._static_token = token
         self._email = email
@@ -106,6 +110,8 @@ class OneMapClient:
         self._http = http or httpx.AsyncClient(timeout=timeout)
         self._owns_http = http is None
         self._sem = asyncio.Semaphore(max_concurrency)
+        self._refresh_lock = asyncio.Lock()
+        self._requests = WindowLimit(requests_per_minute)
         self._max_retries = max_retries
         self._backoff_base = backoff_base
         self._pt_max_walk_distance_m = pt_max_walk_distance_m
@@ -127,6 +133,7 @@ class OneMapClient:
             password=settings.onemap_password_value,
             pt_max_walk_distance_m=settings.pt_max_walk_distance_m,
             pt_num_itineraries=settings.pt_num_itineraries,
+            requests_per_minute=settings.onemap_requests_per_minute,
         )
 
     async def __aenter__(self) -> OneMapClient:
@@ -142,6 +149,8 @@ class OneMapClient:
     def clear_cache(self) -> None:
         """Discard route coordinates retained by the in-memory response cache."""
         self._cache.clear()
+        if work := CURRENT_TRIP.get():
+            work.cache.clear()
 
     # --- Authentication ---------------------------------------------------
 
@@ -151,15 +160,16 @@ class OneMapClient:
     async def _auth_token(self) -> str:
         """Return a usable token, preferring the self-refreshing email/password flow."""
         if self._can_refresh():
-            if (
-                self._token
-                and self._token_expiry
-                and datetime.now(UTC) < self._token_expiry - TOKEN_REFRESH_MARGIN
-            ):
+            async with self._refresh_lock:
+                if (
+                    self._token
+                    and self._token_expiry
+                    and datetime.now(UTC) < self._token_expiry - TOKEN_REFRESH_MARGIN
+                ):
+                    return self._token
+                await self._login()
+                assert self._token is not None
                 return self._token
-            await self._login()
-            assert self._token is not None
-            return self._token
         if self._static_token:
             return self._static_token
         raise OneMapAuthError(
@@ -167,7 +177,8 @@ class OneMapClient:
         )
 
     async def _login(self) -> None:
-        resp = await self._http.post(
+        resp = await self._send(
+            "POST",
             f"{BASE_URL}{AUTH_PATH}",
             json={"email": self._email, "password": self._password},
         )
@@ -191,6 +202,30 @@ class OneMapClient:
 
     # --- HTTP with retry/refresh -----------------------------------------
 
+    async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Count every actual attempt, including auth/search/retries, before sending."""
+        async with self._sem:
+            if work := CURRENT_TRIP.get():
+                work.claim()
+            self._requests.claim()
+            return await self._http.request(method, url, **kwargs)
+
+    def _retry_delay(self, response: httpx.Response, attempt: int) -> float:
+        delay = self._backoff_base * (2**attempt)
+        raw = response.headers.get("Retry-After")
+        if raw:
+            try:
+                delay = max(delay, float(raw))
+            except ValueError:
+                try:
+                    at = parsedate_to_datetime(raw)
+                    delay = max(delay, (at - datetime.now(UTC)).total_seconds())
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        if delay > 60:
+            raise WorkLimitExceeded("OneMap requested a longer wait. Please retry later.")
+        return max(0.0, delay)
+
     async def _request(
         self,
         method: str,
@@ -206,7 +241,7 @@ class OneMapClient:
             if needs_auth:
                 headers["Authorization"] = await self._auth_token()
             try:
-                resp = await self._http.request(method, url, params=params, headers=headers)
+                resp = await self._send(method, url, params=params, headers=headers)
             except httpx.TransportError as exc:
                 # Timeouts and dropped connections happen under a burst of routing
                 # calls; these requests are read-only GETs, so retry with backoff
@@ -224,7 +259,7 @@ class OneMapClient:
                 continue
 
             if resp.status_code == 429 and attempt < self._max_retries:
-                delay = self._backoff_base * (2**attempt)
+                delay = self._retry_delay(resp, attempt)
                 attempt += 1
                 logger.warning("OneMap rate limited (429); backing off %.1fs", delay)
                 await asyncio.sleep(delay)
@@ -233,7 +268,10 @@ class OneMapClient:
             if resp.status_code == 401 and needs_auth and not refreshed:
                 if self._can_refresh():
                     logger.info("OneMap returned 401; refreshing token and retrying once")
-                    await self._login()
+                    async with self._refresh_lock:
+                        # Another failed request may already have refreshed this token.
+                        if self._token == headers["Authorization"]:
+                            await self._login()
                     refreshed = True
                     continue
                 raise OneMapAuthError(
@@ -290,26 +328,23 @@ class OneMapClient:
         self, route_type: str, start: LatLng, end: LatLng, depart: datetime
     ) -> float | None:
         key = (route_type, start.as_param, end.as_param, _round_depart(depart))
-        if key in self._cache:
-            return self._cache[key]
-        async with self._sem:
-            if key in self._cache:  # another task may have filled it while we waited
-                return self._cache[key]
-            params = self._route_params(route_type, start, end, depart)
-            try:
-                resp = await self._request(
-                    "GET", f"{BASE_URL}{ROUTE_PATH}", params=params, needs_auth=True
-                )
-            except httpx.HTTPStatusError as exc:
-                # OneMap answers 404 for unroutable pairs (including start == end);
-                # that is "no route found", not an error worth failing the query for.
-                if exc.response.status_code == 404:
-                    self._cache[key] = None
-                    return None
-                raise
-            minutes = self._parse_route(route_type, resp.json())
-            self._cache[key] = minutes
-            return minutes
+        work = CURRENT_TRIP.get()
+        cache = work.cache if work is not None else self._cache
+        if key in cache:
+            return cache[key]
+        params = self._route_params(route_type, start, end, depart)
+        try:
+            resp = await self._request(
+                "GET", f"{BASE_URL}{ROUTE_PATH}", params=params, needs_auth=True
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                cache[key] = None
+                return None
+            raise
+        minutes = self._parse_route(route_type, resp.json())
+        cache[key] = minutes
+        return minutes
 
     def _route_params(self, route_type: str, start: LatLng, end: LatLng, depart: datetime) -> dict:
         params: dict = {

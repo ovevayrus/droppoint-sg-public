@@ -14,7 +14,7 @@ from functools import lru_cache
 from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Load a local .env into the process environment if present. pydantic-settings also
@@ -90,6 +90,14 @@ class Settings(BaseSettings):
     # --- OneMap public-transport routing parameters ---
     pt_max_walk_distance_m: int = 1000
     pt_num_itineraries: int = 3
+
+    # Single-process safeguards, not claims about the provider's account quota.
+    max_trip_requests: int = Field(default=300, ge=1, le=10000)
+    trip_work_seconds: float = Field(default=180.0, gt=0, le=900)
+    trips_per_minute: int = Field(default=20, ge=1, le=1000)
+    user_cooldown_seconds: float = Field(default=60.0, gt=0, le=3600)
+    onemap_requests_per_minute: int = Field(default=600, ge=1, le=10000)
+    allow_webhook_reset: bool = False
 
     # --- Secrets (never logged, never committed) ---
     onemap_token: SecretStr | None = None
