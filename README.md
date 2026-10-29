@@ -1,6 +1,10 @@
 # DropPoint SG
 
-A Telegram bot that compares driving and public-transport routes in Singapore.
+Find a practical pickup or drop-off point for a Singapore carpool. This Telegram bot compares OneMap driving and public-transport routes, then shows the driver's detour and each passenger's travel time.
+
+It handles one to three passengers, including shared drop-off routes and pickups with suggested departure times. This is a self-hosted prototype with a starter station dataset. Check suggested stopping points and travel times yourself.
+
+In a private **test-bot** chat, send `/start`, then send the shared origin, driver destination and passenger destinations in one message, one place per line. Send `now` or a departure time next. Use `/pickup` when passengers start in different places. Reply examples below are illustrative, not captured Telegram conversations or measured travel-time claims.
 
 Say two people leave from the same place. One is driving to their own destination;
 the other is headed somewhere else. DropPoint tests MRT/LRT stations and major
@@ -57,8 +61,8 @@ time for each passenger.
 
 Times come from [OneMap](https://www.onemap.gov.sg/apidocs/), the Singapore Land
 Authority map service. Before calling the API, a rough geometric filter removes
-stations that are well outside the A-to-B corridor. A query makes at most
-`MAX_CANDIDATES_EVALUATED × 3 + 2` routing calls.
+stations that are well outside the A-to-B corridor. Single-rider scoring needs at most
+`MAX_CANDIDATES_EVALUATED × 3 + 2` route legs before retries. Geocoding, authentication, retries and joint planning add work. The explicit attempt allowance below counts every outbound HTTP attempt.
 
 ## Quick start
 
@@ -68,7 +72,7 @@ Requires Python 3.11+.
 # 1. Install (a virtual environment is recommended)
 python -m venv .venv
 . .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -c constraints.txt -e ".[dev]"
 
 # 2. Configure secrets
 cp .env.example .env        # then edit .env
@@ -76,7 +80,7 @@ cp .env.example .env        # then edit .env
 # 3. Run the tests (offline, no network needed)
 pytest -q
 
-# 4. Run the bot
+# 4. Run a separate test bot; polling changes that bot's delivery mode
 droppoint-bot               # or: python -m droppoint.bot
 ```
 
@@ -93,13 +97,32 @@ Copy `.env.example` to `.env` and fill in:
 See `.env.example` for the full list and optional tuning knobs. `.env` is gitignored;
 never commit it.
 
+### Work limits and safe startup
+
+The supported deployment is one polling process. Defaults are finite demo safeguards, **not** the numerical quota of your OneMap account:
+
+| Variable | Default | What it bounds |
+|---|---:|---|
+| `MAX_TRIP_REQUESTS` | 300 | Outbound attempts across both phases, including auth/retries |
+| `TRIP_WORK_SECONDS` | 180 | Cumulative active work time; waiting for the user is excluded |
+| `TRIPS_PER_MINUTE` | 20 | Accepted trip starts per polling process |
+| `USER_COOLDOWN_SECONDS` | 60 | Minimum time between one user's location submissions |
+| `ONEMAP_REQUESTS_PER_MINUTE` | 600 | Shared outbound attempts, including search/auth/routing |
+| `ALLOW_WEBHOOK_RESET` | false | Permission to replace an existing webhook with polling |
+
+Verify your actual OneMap entitlement and lower these limits to match it. A rejected or slow trip gets a retry message, not a partially verified route. All outbound paths share concurrency limits; simultaneous token refreshes share a lock. A long provider `Retry-After` stops the trip instead of retrying too early or sleeping indefinitely.
+
+These in-process counters do not protect multiple instances. Do not run several pollers for the same bot token or claim distributed quota protection. A multiworker/webhook deployment needs a shared limiter.
+
+Startup reads webhook information first and refuses an existing webhook unless `ALLOW_WEBHOOK_RESET=true`. Prefer a separate test bot. The override can interrupt hosted delivery; restoring its prior webhook is an operator action.
+
 ### Privacy and logs
 
 The bot accepts trip details only in a private Telegram chat. Locations are sent to
 Telegram and OneMap so the bot can resolve places and
 calculate routes. DropPoint SG does not write them to its own database: they live in
 the bot process's per-user memory during an active trip. They are cleared after a
-result, cancellation, or error, and an unfinished trip expires after 15 minutes.
+result, cancellation, or error, and an unfinished trip expires after 15 minutes. Parallel tasks are cancelled and awaited before cleanup; each active phase owns its short-lived coordinate cache. Admission IDs are retained only through the cooldown window.
 Telegram, OneMap, and your hosting provider have their own retention policies.
 Opening a result's Google Maps link sends its route coordinates to Google.
 
@@ -109,8 +132,7 @@ enable HTTPX debug or INFO logging in production without adding equivalent redac
 
 ## Using the bot
 
-In a private chat, send `/start`, then follow the prompts: starting point, the driver's
-destination, the rider's destination, and a departure time (or "now"). Each location
+In a private chat, send `/start`, then send all three to five places in one message: starting point, driver destination and passenger destinations, one per line. Send a departure time (or "now") separately. Each location
 can be a postal code, building name, or address. The bot replies with the best
 drop-off, up to two alternatives, and a Google Maps link:
 
@@ -192,8 +214,7 @@ With credentials in `.env`, confirm the bot end to end:
 
 1. `droppoint-bot` to start polling.
 2. In Telegram, message your bot `/start`.
-3. Send a starting point (e.g. `Jurong East MRT`), then a driver destination
-   (e.g. `Tampines`), then a rider destination (e.g. `Somerset`), then `now`.
+3. Send `Jurong East MRT`, `Tampines` and `Somerset` in one message, one place per line; then send `now` separately. Use public places rather than private addresses in demonstrations.
 4. You should get a best drop-off with driver/rider times and a Google Maps link.
 
 A quick non-Telegram check of the OneMap client and optimiser:
